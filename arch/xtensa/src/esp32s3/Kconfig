@@ -2754,6 +2754,16 @@ config ESP32S3_CAM_D7_PIN
 	int "CAM Data Bit-7 Pin"
 	default 9
 
+config ESP32S3_CAM_VSYNC_INVERT
+	bool "Invert VSYNC Signal"
+	default n
+	---help---
+		Invert the VSYNC signal polarity via the GPIO matrix.
+		Some image sensors (e.g. OV2640) output active-high VSYNC
+		while the ESP32-S3 CAM controller expects active-low.
+		Enable this option if the sensor VSYNC polarity does not
+		match the CAM controller expectation.
+
 endmenu # Camera (DVP) Configuration
 
 menu "SD/MMC Configuration"

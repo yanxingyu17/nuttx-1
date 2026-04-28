@@ -34,6 +34,8 @@
 
 #include <nuttx/spinlock.h>
 #include <nuttx/kmalloc.h>
+#include <nuttx/cache.h>
+#include <nuttx/wqueue.h>
 #include <nuttx/video/imgdata.h>
 
 #include <arch/board/board.h>
@@ -101,13 +103,17 @@ struct esp32s3_cam_s
 
   struct esp32s3_dmadesc_s *dmadesc; /* Heap-allocated DMA descriptors */
 
-  uint8_t *fb;                    /* Frame buffer */
-  uint32_t fb_size;               /* Frame buffer size */
+  uint8_t *fb;                    /* DMA frame buffer */
+  uint8_t *v4l2_buf;              /* V4L2 userptr buffer */
+  uint32_t fb_size;               /* Frame data size (bytes) */
+  uint32_t fb_alloc;              /* DMA buffer allocated size */
   bool fb_allocated;              /* true if driver allocated fb */
   uint8_t vsync_cnt;              /* VSYNC counter for frame sync */
 
   imgdata_capture_t cb;           /* Capture done callback */
   void *cb_arg;                   /* Callback argument */
+  struct work_s frame_work;       /* Deferred frame completion */
+  struct timeval frame_ts;        /* Frame timestamp from ISR */
 
   uint16_t width;
   uint16_t height;
@@ -170,6 +176,39 @@ static struct esp32s3_cam_s g_cam_priv =
  ****************************************************************************/
 
 /****************************************************************************
+ * Name: frame_complete_worker
+ *
+ * Description:
+ *   Deferred frame completion handler (runs in LPWORK context).
+ *   Invalidates DCache over the DMA buffer, copies frame data to the
+ *   V4L2 userptr buffer, then invokes the capture callback.
+ *
+ *   Running outside ISR context allows safe use of memcpy and dcache
+ *   operations which cannot execute from IRAM.
+ *
+ ****************************************************************************/
+
+static void frame_complete_worker(void *arg)
+{
+  struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
+
+  if (priv->cb == NULL || priv->fb == NULL)
+    {
+      return;
+    }
+
+  up_invalidate_dcache((uintptr_t)priv->fb,
+                       (uintptr_t)priv->fb + priv->fb_size);
+
+  if (priv->v4l2_buf != NULL)
+    {
+      memcpy(priv->v4l2_buf, priv->fb, priv->fb_size);
+    }
+
+  priv->cb(0, priv->fb_size, &priv->frame_ts, priv->cb_arg);
+}
+
+/****************************************************************************
  * Name: cam_interrupt
  *
  * Description:
@@ -207,66 +246,37 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
             }
           else if (priv->vsync_cnt >= 2 && priv->cb)
             {
-              struct timeval ts;
-
-              /* Stop capture and DMA before invoking callback.
-               * The callback may call set_buf() which rewrites DMA
-               * descriptors.  If DMA is still draining the CAM AFIFO
-               * it could read half-written descriptors and follow a
-               * corrupted pbuf pointer, writing pixel data over
-               * unrelated memory (e.g. g_cam_priv.data.ops).
+              /* Stop capture and DMA.  The callback may call
+               * set_buf() which rewrites DMA descriptors, so
+               * hardware must be fully quiesced first.
                */
 
               cam_ll_stop(priv->hw);
-
-              /* Stop DMA channel before callback to prevent race */
-
               esp32s3_dma_reset_channel(priv->dma_channel, false);
 
-              gettimeofday(&ts, NULL);
+              gettimeofday(&priv->frame_ts, NULL);
 
-              /* Notify frame complete */
-
-              priv->cb(0, priv->fb_size, &ts, priv->cb_arg);
-
-              /* Check if callback called stop_capture.  With a
-               * single-buffer FIFO the V4L2 layer stops capture
-               * inside the callback; restarting DMA after that
-               * would run unsynchronized and corrupt memory.
+              /* Defer dcache invalidate + memcpy + callback to
+               * LPWORK — these cannot run from IRAM ISR context.
                */
 
-              if (!priv->capturing)
-                {
-                  priv->vsync_cnt = 0;
-                }
-              else
-                {
-                  /* Restart capture for next frame */
+              work_queue(LPWORK, &priv->frame_work,
+                         frame_complete_worker, priv, 0);
 
-                  priv->vsync_cnt = 0;
+              /* Restart capture for next frame immediately so
+               * that the sensor keeps streaming while the worker
+               * processes the completed frame.
+               */
 
-                  /* DMA channel was already reset before the
-                   * callback above.  Reset CAM + AFIFO now.
-                   */
-
-                  cam_ll_reset(priv->hw);
-                  cam_ll_fifo_reset(priv->hw);
-
-                  /* Re-set REC_DATA_BYTELEN after reset */
-
-                  cam_ll_set_recv_data_bytelen(priv->hw,
-                                               ESP32S3_CAM_DMA_BUFLEN - 1);
-
-                  /* Reload DMA descriptors */
-
-                  esp32s3_dma_load(priv->dmadesc, priv->dma_channel,
-                                   false);
-                  esp32s3_dma_enable(priv->dma_channel, false);
-
-                  /* Restart */
-
-                  cam_ll_start(priv->hw);
-                }
+              priv->vsync_cnt = 0;
+              cam_ll_reset(priv->hw);
+              cam_ll_fifo_reset(priv->hw);
+              cam_ll_set_recv_data_bytelen(priv->hw,
+                                           ESP32S3_CAM_DMA_BUFLEN - 1);
+              esp32s3_dma_load(priv->dmadesc, priv->dma_channel,
+                               false);
+              esp32s3_dma_enable(priv->dma_channel, false);
+              cam_ll_start(priv->hw);
             }
         }
     }
@@ -323,10 +333,14 @@ static void esp32s3_cam_gpio_config(void)
   esp_configgpio(CONFIG_ESP32S3_CAM_PCLK_PIN, INPUT);
   esp_gpio_matrix_in(CONFIG_ESP32S3_CAM_PCLK_PIN, CAM_PCLK_IDX, false);
 
-  /* VSYNC input */
+  /* VSYNC input — invert if sensor polarity requires it */
 
   esp_configgpio(CONFIG_ESP32S3_CAM_VSYNC_PIN, INPUT);
+#ifdef CONFIG_ESP32S3_CAM_VSYNC_INVERT
+  esp_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN, CAM_V_SYNC_IDX, true);
+#else
   esp_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN, CAM_V_SYNC_IDX, false);
+#endif
 
   /* HREF (H_ENABLE) input */
 
@@ -540,11 +554,9 @@ static int esp32s3_cam_uninit(struct imgdata_s *data)
   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
   irqstate_t flags;
 
-  /* Stop capture */
+  work_cancel_sync(LPWORK, &priv->frame_work);
 
   cam_ll_stop(priv->hw);
-
-  /* Reset CAM module and AFIFO to stop all hardware activity */
 
   cam_ll_reset(priv->hw);
   cam_ll_fifo_reset(priv->hw);
@@ -625,20 +637,32 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
   priv->height = datafmts[IMGDATA_FMT_MAIN].height;
   priv->pixfmt = datafmts[IMGDATA_FMT_MAIN].pixelformat;
 
+  priv->fb_size = priv->width * priv->height * 2;
+
   if (addr != NULL && size > 0)
     {
-      priv->fb = addr;
-      priv->fb_size = size;
-      priv->fb_allocated = false;
+      /* V4L2 userptr mode: app provides its own buffer for the
+       * completed frame.  We still need a separate DMA-aligned
+       * buffer because DMA writes may overshoot and the userptr
+       * may not meet alignment requirements.
+       */
+
+      priv->v4l2_buf = addr;
+      priv->fb_alloc = priv->fb_size + ESP32S3_CAM_DMA_ALIGN;
+      priv->fb = kmm_memalign(ESP32S3_CAM_DMA_ALIGN, priv->fb_alloc);
+      if (!priv->fb)
+        {
+          snerr("ERROR: Failed to allocate DMA buffer\n");
+          return -ENOMEM;
+        }
+
+      priv->fb_allocated = true;
     }
   else
     {
-      /* Allocate frame buffer in PSRAM if available.
-       * 8-bit DVP formats (RGB565, YUV422) are all 2 bytes per pixel.
-       */
-
-      priv->fb_size = priv->width * priv->height * 2;
-      priv->fb = kmm_memalign(ESP32S3_CAM_DMA_ALIGN, priv->fb_size);
+      priv->v4l2_buf = NULL;
+      priv->fb_alloc = priv->fb_size;
+      priv->fb = kmm_memalign(ESP32S3_CAM_DMA_ALIGN, priv->fb_alloc);
       if (!priv->fb)
         {
           snerr("ERROR: Failed to allocate frame buffer\n");
@@ -648,15 +672,13 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
       priv->fb_allocated = true;
     }
 
-  memset(priv->fb, 0, priv->fb_size);
-
-  /* Setup DMA descriptors for RX into frame buffer */
+  memset(priv->fb, 0, priv->fb_alloc);
 
   esp32s3_dma_setup(priv->dmadesc,
                     ESP32S3_CAM_DMADESC_NUM,
                     priv->fb,
-                    priv->fb_size,
-                    false,  /* RX */
+                    priv->fb_alloc,
+                    false,
                     priv->dma_channel);
 
   return OK;
@@ -783,11 +805,15 @@ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
 
   flags = spin_lock_irqsave(&priv->lock);
 
-  /* Mark not capturing first so ISR won't process further VSYNCs */
-
   priv->capturing = false;
   priv->cb = NULL;
   priv->cb_arg = NULL;
+
+  spin_unlock_irqrestore(&priv->lock, flags);
+
+  work_cancel_sync(LPWORK, &priv->frame_work);
+
+  flags = spin_lock_irqsave(&priv->lock);
 
   /* Stop capture engine */
 
