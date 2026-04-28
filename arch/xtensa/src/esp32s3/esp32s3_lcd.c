@@ -663,7 +663,8 @@ static int IRAM_ATTR lcd_interrupt(int irq, void *context, void *arg)
   union fb_paninfo_u info;
   struct esp32s3_layer_s *layer;
 
-  esp32s3_lcd_putreg(LCD_CAM_LC_DMA_INT_CLR_REG, status);
+  esp32s3_lcd_putreg(LCD_CAM_LC_DMA_INT_CLR_REG,
+                     status & LCD_CAM_LCD_VSYNC_INT_ST_M);
   if (status & LCD_CAM_LCD_VSYNC_INT_ST_M)
     {
       /* Stop TX */
@@ -963,7 +964,8 @@ static int esp32s3_lcd_config(void)
 
   /* Configure interrupt */
 
-  regval = LCD_CAM_LCD_VSYNC_INT_ENA_M;
+  regval  = esp32s3_lcd_getreg(LCD_CAM_LC_DMA_INT_ENA_REG);
+  regval |= LCD_CAM_LCD_VSYNC_INT_ENA_M;
   esp32s3_lcd_putreg(LCD_CAM_LC_DMA_INT_ENA_REG, regval);
 
   flags = spin_lock_irqsave(&priv->lock);
