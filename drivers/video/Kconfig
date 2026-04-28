@@ -465,6 +465,14 @@ config OV2640_REGDEBUG
 
 endif # VIDEO_OV2640
 
+config VIDEO_OV2640_V4L2
+	bool "OV2640 camera chip (V4L2 imgsensor)"
+	default n
+	select I2C
+	---help---
+		OV2640 2MP CMOS image sensor with DVP interface.
+		This is the V4L2 imgsensor driver (not the legacy ov2640.c).
+
 config VIDEO_GC0308
 	bool "GC0308 camera chip"
 	default n
